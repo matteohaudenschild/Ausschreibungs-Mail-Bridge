@@ -462,6 +462,8 @@ def iso_or_empty(value: Any) -> str:
 def post_messages(messages: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     message_list = list(messages)
     batch_size = max(1, int(env("POST_BATCH_SIZE", "10")))
+    attempts = parse_int_env("APPS_SCRIPT_POST_RETRIES", 3, minimum=1)
+    retry_delay_seconds = parse_int_env("APPS_SCRIPT_POST_RETRY_DELAY_SECONDS", 3, minimum=0)
     result: Dict[str, Any] = {"ok": True, "appended": 0, "updated": 0, "skipped": 0}
 
     for index in range(0, len(message_list), batch_size):
@@ -469,12 +471,7 @@ def post_messages(messages: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
             "token": required_env("BRIDGE_TOKEN"),
             "messages": message_list[index:index + batch_size],
         }
-        response = requests.post(
-            required_env("APPS_SCRIPT_WEBAPP_URL"),
-            json=payload,
-            timeout=int(env("APPS_SCRIPT_TIMEOUT", "60")),
-        )
-        response.raise_for_status()
+        response = post_batch_with_retry(payload, attempts, retry_delay_seconds)
         batch_result = response.json()
         if not batch_result.get("ok"):
             raise SystemExit(f"Apps Script error: {batch_result}")
@@ -483,6 +480,45 @@ def post_messages(messages: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
             result[key] += int(batch_result.get(key, 0) or 0)
 
     return result
+
+
+def post_batch_with_retry(payload: Dict[str, Any], attempts: int, retry_delay_seconds: int) -> requests.Response:
+    """Post an idempotent batch and retry only temporary Apps Script failures.
+
+    The receiving Apps Script deduplicates by Exchange message ID, so retrying a
+    batch is safe even if a response is lost after the sheet write succeeds.
+    """
+    retryable_statuses = {404, 408, 429, 500, 502, 503, 504}
+    url = required_env("APPS_SCRIPT_WEBAPP_URL")
+    timeout = int(env("APPS_SCRIPT_TIMEOUT", "60"))
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.post(url, json=payload, timeout=timeout)
+            if response.status_code not in retryable_statuses or attempt >= attempts:
+                response.raise_for_status()
+                return response
+            error = requests.HTTPError(f"HTTP {response.status_code}", response=response)
+        except requests.RequestException as error:
+            status_code = getattr(getattr(error, "response", None), "status_code", None)
+            if status_code is not None and status_code not in retryable_statuses:
+                raise
+            if attempt >= attempts:
+                raise
+
+        print(json.dumps({
+            "ok": False,
+            "stage": "apps_script_post",
+            "transient": True,
+            "attempt": attempt,
+            "attempts": attempts,
+            "error": safe_error(error),
+            "note": "Temporary Apps Script post failure. Retrying the idempotent batch.",
+        }, ensure_ascii=False))
+        if retry_delay_seconds:
+            time.sleep(retry_delay_seconds * (2 ** (attempt - 1)))
+
+    raise RuntimeError("unreachable Apps Script retry state")
 
 
 def parse_args() -> argparse.Namespace:
