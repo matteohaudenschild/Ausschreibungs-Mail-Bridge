@@ -1,12 +1,15 @@
 import argparse
 import base64
 import json
+import math
 import os
+import random
 import re
 import time
 from datetime import timedelta
 from html import unescape
 from typing import Any, Callable, Dict, Iterable, List, TypeVar
+from urllib.parse import urlsplit
 
 import requests
 from exchangelib import (
@@ -55,6 +58,19 @@ def parse_int_env(name: str, default: int, minimum: int = 0) -> int:
     try:
         parsed = int(value)
     except ValueError:
+        return default
+    return max(minimum, parsed)
+
+
+def parse_float_env(name: str, default: float, minimum: float = 0.0) -> float:
+    value = env(name)
+    if not value:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    if not math.isfinite(parsed):
         return default
     return max(minimum, parsed)
 
@@ -462,8 +478,6 @@ def iso_or_empty(value: Any) -> str:
 def post_messages(messages: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     message_list = list(messages)
     batch_size = max(1, int(env("POST_BATCH_SIZE", "10")))
-    attempts = parse_int_env("APPS_SCRIPT_POST_RETRIES", 3, minimum=1)
-    retry_delay_seconds = parse_int_env("APPS_SCRIPT_POST_RETRY_DELAY_SECONDS", 3, minimum=0)
     result: Dict[str, Any] = {"ok": True, "appended": 0, "updated": 0, "skipped": 0}
 
     for index in range(0, len(message_list), batch_size):
@@ -471,10 +485,9 @@ def post_messages(messages: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
             "token": required_env("BRIDGE_TOKEN"),
             "messages": message_list[index:index + batch_size],
         }
-        response = post_batch_with_retry(payload, attempts, retry_delay_seconds)
-        batch_result = response.json()
+        batch_result = post_apps_script_batch(payload)
         if not batch_result.get("ok"):
-            raise SystemExit(f"Apps Script error: {batch_result}")
+            raise SystemExit("Apps Script returned an error response (ok=false).")
 
         for key in ("appended", "updated", "skipped"):
             result[key] += int(batch_result.get(key, 0) or 0)
@@ -482,43 +495,238 @@ def post_messages(messages: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     return result
 
 
-def post_batch_with_retry(payload: Dict[str, Any], attempts: int, retry_delay_seconds: int) -> requests.Response:
-    """Post an idempotent batch and retry only temporary Apps Script failures.
+def post_apps_script_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Post an idempotent batch with bounded, selective retries.
 
-    The receiving Apps Script deduplicates by Exchange message ID, so retrying a
-    batch is safe even if a response is lost after the sheet write succeeds.
+    The receiving Apps Script deduplicates by Exchange message ID. Repeating the
+    exact batch is therefore safe even if a response is lost after the sheet was
+    already updated.
     """
-    retryable_statuses = {404, 408, 429, 500, 502, 503, 504}
-    url = required_env("APPS_SCRIPT_WEBAPP_URL")
-    timeout = int(env("APPS_SCRIPT_TIMEOUT", "60"))
+    webapp_url = required_env("APPS_SCRIPT_WEBAPP_URL")
+    legacy_attempts = parse_int_env("APPS_SCRIPT_POST_RETRIES", 6, minimum=1)
+    attempts = parse_int_env("APPS_SCRIPT_POST_ATTEMPTS", legacy_attempts, minimum=1)
+    legacy_delay = parse_float_env("APPS_SCRIPT_POST_RETRY_DELAY_SECONDS", 5.0, minimum=0.0)
+    base_delay = parse_float_env("APPS_SCRIPT_RETRY_BASE_DELAY_SECONDS", legacy_delay, minimum=0.0)
+    max_delay = parse_float_env("APPS_SCRIPT_RETRY_MAX_DELAY_SECONDS", 60.0, minimum=0.0)
+    jitter = parse_float_env("APPS_SCRIPT_RETRY_JITTER_SECONDS", 1.0, minimum=0.0)
+    legacy_timeout = parse_float_env("APPS_SCRIPT_TIMEOUT", 60.0, minimum=0.001)
+    connect_timeout = parse_float_env(
+        "APPS_SCRIPT_CONNECT_TIMEOUT_SECONDS", 10.0, minimum=0.001
+    )
+    read_timeout = parse_float_env(
+        "APPS_SCRIPT_READ_TIMEOUT_SECONDS", legacy_timeout, minimum=0.001
+    )
 
     for attempt in range(1, attempts + 1):
         try:
-            response = requests.post(url, json=payload, timeout=timeout)
-            if response.status_code not in retryable_statuses or attempt >= attempts:
-                response.raise_for_status()
-                return response
-            error = requests.HTTPError(f"HTTP {response.status_code}", response=response)
-        except requests.RequestException as error:
-            status_code = getattr(getattr(error, "response", None), "status_code", None)
-            if status_code is not None and status_code not in retryable_statuses:
-                raise
-            if attempt >= attempts:
-                raise
+            response = requests.post(
+                webapp_url,
+                json=payload,
+                timeout=(connect_timeout, read_timeout),
+            )
+        except (
+            requests.Timeout,
+            requests.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ) as exc:
+            if isinstance(exc, requests.Timeout):
+                reason = "timeout"
+            elif isinstance(exc, requests.exceptions.ChunkedEncodingError):
+                reason = "response_interrupted"
+            else:
+                reason = "connection_error"
+            if attempt < attempts:
+                sleep_before_apps_script_retry(
+                    attempt=attempt,
+                    attempts=attempts,
+                    reason=reason,
+                    base_delay=base_delay,
+                    max_delay=max_delay,
+                    jitter=jitter,
+                )
+                continue
+            raise RuntimeError(
+                f"Apps Script request failed after {attempts} attempt(s): {reason}."
+            ) from None
+        except requests.RequestException:
+            raise RuntimeError(
+                "Apps Script request failed with a non-retryable transport error."
+            ) from None
 
-        print(json.dumps({
-            "ok": False,
-            "stage": "apps_script_post",
-            "transient": True,
-            "attempt": attempt,
-            "attempts": attempts,
-            "error": safe_error(error),
-            "note": "Temporary Apps Script post failure. Retrying the idempotent batch.",
-        }, ensure_ascii=False))
-        if retry_delay_seconds:
-            time.sleep(retry_delay_seconds * (2 ** (attempt - 1)))
+        status_code = int(response.status_code)
+        final_host = response_final_host(response)
+        if is_retryable_apps_script_status(status_code, final_host):
+            if attempt < attempts:
+                sleep_before_apps_script_retry(
+                    attempt=attempt,
+                    attempts=attempts,
+                    reason="http_status",
+                    base_delay=base_delay,
+                    max_delay=max_delay,
+                    jitter=jitter,
+                    status_code=status_code,
+                    final_host=final_host,
+                )
+                continue
+            raise RuntimeError(
+                f"Apps Script returned retryable HTTP {status_code} after "
+                f"{attempts} attempt(s)."
+            )
+
+        if not 200 <= status_code < 300:
+            raise RuntimeError(
+                f"Apps Script returned non-retryable HTTP {status_code}."
+            )
+
+        if not (response.content or b"").strip():
+            if attempt < attempts:
+                sleep_before_apps_script_retry(
+                    attempt=attempt,
+                    attempts=attempts,
+                    reason="empty_response",
+                    base_delay=base_delay,
+                    max_delay=max_delay,
+                    jitter=jitter,
+                    status_code=status_code,
+                    final_host=final_host,
+                )
+                continue
+            raise RuntimeError(
+                f"Apps Script returned an empty response after {attempts} attempt(s)."
+            )
+
+        try:
+            batch_result = response.json()
+        except ValueError:
+            if attempt < attempts:
+                sleep_before_apps_script_retry(
+                    attempt=attempt,
+                    attempts=attempts,
+                    reason="non_json_response",
+                    base_delay=base_delay,
+                    max_delay=max_delay,
+                    jitter=jitter,
+                    status_code=status_code,
+                    final_host=final_host,
+                )
+                continue
+            raise RuntimeError(
+                f"Apps Script returned a non-JSON response after {attempts} attempt(s)."
+            ) from None
+
+        if not isinstance(batch_result, dict):
+            if attempt < attempts:
+                sleep_before_apps_script_retry(
+                    attempt=attempt,
+                    attempts=attempts,
+                    reason="invalid_json_response",
+                    base_delay=base_delay,
+                    max_delay=max_delay,
+                    jitter=jitter,
+                    status_code=status_code,
+                    final_host=final_host,
+                )
+                continue
+            raise RuntimeError(
+                f"Apps Script returned invalid JSON after {attempts} attempt(s)."
+            )
+
+        embedded_status = int(nonnegative_finite_number(
+            batch_result.get("statusCode"), default=0.0
+        ))
+        response_is_transient = (
+            batch_result.get("transient") is True
+            or embedded_status in {408, 425, 429}
+            or 500 <= embedded_status <= 599
+        )
+        if batch_result.get("ok") is False and response_is_transient:
+            if attempt < attempts:
+                retry_after = nonnegative_finite_number(
+                    batch_result.get("retryAfterSeconds"), default=0.0
+                )
+                sleep_before_apps_script_retry(
+                    attempt=attempt,
+                    attempts=attempts,
+                    reason="apps_script_transient_response",
+                    base_delay=base_delay,
+                    max_delay=max_delay,
+                    jitter=jitter,
+                    minimum_delay=retry_after,
+                    status_code=embedded_status,
+                    final_host=final_host,
+                )
+                continue
+
+        return batch_result
 
     raise RuntimeError("unreachable Apps Script retry state")
+
+
+def response_final_host(response: requests.Response) -> str:
+    """Return only the final hostname, never a URL containing transient tokens."""
+    try:
+        return (urlsplit(str(response.url or "")).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def is_retryable_apps_script_status(status_code: int, final_host: str) -> bool:
+    if status_code in {408, 425, 429} or 500 <= status_code <= 599:
+        return True
+    return status_code == 404 and final_host == "script.googleusercontent.com"
+
+
+def nonnegative_finite_number(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return max(0.0, parsed)
+
+
+def sleep_before_apps_script_retry(
+    *,
+    attempt: int,
+    attempts: int,
+    reason: str,
+    base_delay: float,
+    max_delay: float,
+    jitter: float,
+    minimum_delay: float = 0.0,
+    status_code: int = 0,
+    final_host: str = "",
+) -> None:
+    delay = base_delay * (2 ** (attempt - 1))
+    if jitter:
+        delay += random.uniform(0.0, jitter)
+    if max_delay:
+        delay = min(delay, max_delay)
+        minimum_delay = min(minimum_delay, max_delay)
+    delay = max(delay, minimum_delay)
+
+    log_entry: Dict[str, Any] = {
+        "ok": False,
+        "stage": "apps_script_post",
+        "transient": True,
+        "attempt": attempt,
+        "attempts": attempts,
+        "reason": reason,
+        "retryInSeconds": round(delay, 3),
+    }
+    if status_code:
+        log_entry["status"] = status_code
+    if final_host:
+        log_entry["finalHost"] = (
+            final_host
+            if final_host in {"script.google.com", "script.googleusercontent.com"}
+            else "other"
+        )
+
+    print(json.dumps(log_entry, ensure_ascii=False))
+    if delay:
+        time.sleep(delay)
 
 
 def parse_args() -> argparse.Namespace:
