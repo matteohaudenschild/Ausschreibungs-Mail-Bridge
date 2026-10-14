@@ -24,7 +24,7 @@ on:
         required: false
         default: "true"
       max_body_html_chars:
-        description: "Maximum HTML body characters to save per message"
+        description: "Legacy compatibility input; v2 preserves full HTML and rejects oversize sources without truncating"
         required: false
         default: "200000"
       dry_run_summary:

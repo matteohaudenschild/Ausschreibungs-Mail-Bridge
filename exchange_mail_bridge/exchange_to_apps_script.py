@@ -1,5 +1,6 @@
 import argparse
 import base64
+import hashlib
 import json
 import math
 import os
@@ -28,6 +29,9 @@ from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
 
 
 DEFAULT_EWS_URL = "https://mail.wackerhagengruppe.de/EWS/Exchange.asmx"
+BODY_TRANSPORT_VERSION = 2
+MAX_BODY_SOURCE_BYTES = 8 * 1024 * 1024
+MAX_POST_PAYLOAD_BYTES = 12 * 1024 * 1024
 T = TypeVar("T")
 
 
@@ -195,8 +199,24 @@ def serialize_item(
 ) -> Dict[str, Any]:
     sender = getattr(item, "sender", None) or getattr(item, "author", None)
     body_preview = extract_body_preview(item)
-    body_html = extract_body_html(item, max_body_html_chars) if include_body_html else ""
-    body_text_full = extract_body_text(item, limit=50000)
+    # V2 never uses a character cap as silent truncation. The legacy option is
+    # accepted for command/config compatibility, but originals are preserved.
+    body_html = extract_body_html(item, max_body_html_chars)
+    if body_html and not include_body_html:
+        raise ValueError("Lossless transport v2 requires INCLUDE_BODY_HTML for HTML messages")
+    body_text_full = extract_body_text(item, limit=None)
+    body_text_raw = str(getattr(item, "text_body", "") or "")
+    if not body_text_raw and not body_html:
+        body_text_raw = str(getattr(item, "body", "") or "")
+    source_parts = {"bodyHtml": body_html, "bodyTextRaw": body_text_raw, "bodyTextFull": body_text_full}
+    body_integrity = {"version": BODY_TRANSPORT_VERSION}
+    body_integrity.update({name: body_integrity_metadata(value) for name, value in source_parts.items()})
+    if sum(body_integrity[name]["utf8Bytes"] for name in source_parts) > MAX_BODY_SOURCE_BYTES:
+        raise ValueError("Lossless transport source exceeds the hard byte limit; nothing was truncated")
+    source_manifest = {"version": BODY_TRANSPORT_VERSION, "messageId": str(getattr(item, "id", "") or ""),
+                       "bodyIntegrity": body_integrity, "bodyTextRaw": body_text_raw, "bodyTextFull": body_text_full}
+    if len(json.dumps(source_manifest, ensure_ascii=False).encode("utf-8")) > MAX_BODY_SOURCE_BYTES - 4096:
+        raise ValueError("Lossless source manifest exceeds the hard byte limit; nothing was truncated")
     body_links = extract_body_links(item)
     attachments = serialize_attachments(item, include_attachments, max_attachment_bytes)
     body_image_urls = extract_body_image_urls(item)
@@ -210,7 +230,9 @@ def serialize_item(
         "subject": str(getattr(item, "subject", "") or ""),
         "bodyPreview": body_preview,
         "bodyTextFull": body_text_full,
+        "bodyTextRaw": body_text_raw,
         "bodyHtml": body_html,
+        "bodyIntegrity": body_integrity,
         "bodyLinks": body_links,
         "hasAttachments": bool(getattr(item, "has_attachments", False) or attachments),
         "attachmentCount": attachment_count,
@@ -225,7 +247,16 @@ def extract_body_preview(item: Any, limit: int = 1000) -> str:
     return extract_body_text(item, limit=limit)
 
 
-def extract_body_text(item: Any, limit: int = 50000) -> str:
+def body_integrity_metadata(value: str) -> Dict[str, Any]:
+    encoded = value.encode("utf-8")
+    return {
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "utf8Bytes": len(encoded),
+        "utf16Length": len(value.encode("utf-16-le")) // 2,
+    }
+
+
+def extract_body_text(item: Any, limit: int = None) -> str:
     text_body = getattr(item, "text_body", None)
     body = getattr(item, "body", None)
     html_text = html_to_text(str(body)) if body else ""
@@ -248,7 +279,7 @@ def extract_body_html(item: Any, limit: int) -> str:
         return ""
     if "<" not in body and ">" not in body:
         return ""
-    return body[:limit]
+    return body
 
 
 def html_to_text(value: str) -> str:
@@ -480,12 +511,13 @@ def post_messages(messages: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     batch_size = max(1, int(env("POST_BATCH_SIZE", "10")))
     result: Dict[str, Any] = {"ok": True, "appended": 0, "updated": 0, "skipped": 0}
 
-    for index in range(0, len(message_list), batch_size):
-        payload = {
-            "token": required_env("BRIDGE_TOKEN"),
-            "messages": message_list[index:index + batch_size],
-        }
+    token = required_env("BRIDGE_TOKEN")
+    for batch in iter_lossless_batches(message_list, batch_size, token):
+        payload = {"token": token, "messages": batch}
         batch_result = post_apps_script_batch(payload)
+        if any(message.get("bodyIntegrity", {}).get("version") == BODY_TRANSPORT_VERSION for message in batch):
+            if batch_result.get("protocolVersion") != BODY_TRANSPORT_VERSION:
+                raise ValueError("Receiver did not acknowledge lossless transport v2; verify the deployed endpoint")
         if not batch_result.get("ok"):
             raise SystemExit("Apps Script returned an error response (ok=false).")
 
@@ -493,6 +525,23 @@ def post_messages(messages: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
             result[key] += int(batch_result.get(key, 0) or 0)
 
     return result
+
+
+def iter_lossless_batches(messages: Iterable[Dict[str, Any]], batch_size: int, token: str):
+    batch = []
+    for message in messages:
+        trial = batch + [message]
+        trial_bytes = len(json.dumps({"token": token, "messages": trial}, ensure_ascii=True).encode("utf-8"))
+        if batch and (len(trial) > batch_size or trial_bytes > MAX_POST_PAYLOAD_BYTES):
+            yield batch
+            batch = []
+            trial = [message]
+            trial_bytes = len(json.dumps({"token": token, "messages": trial}, ensure_ascii=True).encode("utf-8"))
+        if trial_bytes > MAX_POST_PAYLOAD_BYTES:
+            raise ValueError("Lossless transport message exceeds the hard JSON payload limit; nothing was truncated")
+        batch = trial
+    if batch:
+        yield batch
 
 
 def post_apps_script_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
